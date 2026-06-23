@@ -1,0 +1,19 @@
+# Oversized original game binary. Keep it out of the public repo.
+PenguinHotel-Win64-Shipping.exe
+
+# Runtime logs and local UI/window state.
+*.log
+imgui.ini
+liveview/
+watches/
+
+# Local mod logs. Source and dump files are tracked; noisy runtime logs are not.
+Mods/ChameleonQoL/qol.log
+Mods/ChameleonDiscovery/discovery.log
+
+# Generic build/cache leftovers if they appear later.
+*.pdb
+*.ilk
+*.tmp
+*.bak
+*.old

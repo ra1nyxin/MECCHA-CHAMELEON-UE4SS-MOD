@@ -1,0 +1,8 @@
+#ifndef UE4SS_SDK_BP_FirstPersonCharacter_cLeon_Character_Survivor_Default_Base_Child_1point7_HPP
+#define UE4SS_SDK_BP_FirstPersonCharacter_cLeon_Character_Survivor_Default_Base_Child_1point7_HPP
+
+class ABP_FirstPersonCharacter_cLeon_Character_Survivor_Default_Base_Child_1point7_C : public ABP_FirstPersonCharacter_cLeon_Character_Survivor_Default_Base_C
+{
+}; // Size: 0xD00
+
+#endif
