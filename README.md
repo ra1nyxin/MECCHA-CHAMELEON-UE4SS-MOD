@@ -50,7 +50,7 @@ cham apply
 cham size 1.35
 # cham：主命令。
 # size：体型功能。
-# 1.35：目标体型倍率；范围 0.2 到 5.0；只应用到本机 PlayerController 当前 Pawn。
+# 1.35：目标体型倍率；必须是正数，没有上限限制；默认走 physical 模式，只应用到本机 PlayerController 当前 Pawn。
 ```
 
 ```text
@@ -171,11 +171,35 @@ cham paint default
 
 体型功能只修改本地 `PlayerController.Pawn`。每次命令执行前都会重新获取本地 Pawn，避免换角色样式、重生、进出房间后拿到旧对象。
 
+默认 `physical` 模式会同时处理：
+
+- Actor 视觉缩放：`SetActorScale3D`。
+- `BodyCapsule` / `OverapCollision` 胶囊体。
+- `DynamicCapsuleHeightControl` 当前/站立/蹲伏半高。
+- `DynamicCapsuleHeightSettings` 的最小/最大胶囊高度限制。
+- 缩放前后胶囊半高差导致的脚底 Z 补偿。
+
+这样比旧版单纯缩放 Actor 更适合超小体型、老鼠洞、沙发靠墙小角落这类低矮空间。
+
 ```text
 cham size 1.35
 # cham：主命令。
 # size：体型功能。
-# 1.35：目标体型倍率；范围 0.2 到 5.0；开启持续应用。
+# 1.35：目标体型倍率；必须是正数，没有上限限制；默认 physical 模式，开启持续应用。
+```
+
+```text
+cham size 0.05
+# cham：主命令。
+# size：体型功能。
+# 0.05：很小的体型倍率；会同步视觉、碰撞胶囊、动态胶囊高度和脚底补偿。
+```
+
+```text
+cham size 2000
+# cham：主命令。
+# size：体型功能。
+# 2000：超大体型倍率；没有人为上限，实际表现取决于 UE 物理、地图碰撞和相机裁剪。
 ```
 
 ```text
@@ -183,7 +207,23 @@ cham size set 1.35
 # cham：主命令。
 # size：体型功能。
 # set：显式设置体型；等价于 cham size 1.35。
-# 1.35：目标体型倍率；范围 0.2 到 5.0。
+# 1.35：目标体型倍率；必须是正数，没有上限限制。
+```
+
+```text
+cham size physical 0.05
+# cham：主命令。
+# size：体型功能。
+# physical：默认模式；同步 Actor scale、碰撞胶囊、动态胶囊高度、动态胶囊设置和脚底补偿。
+# 0.05：目标体型倍率；适合钻老鼠洞这类低矮空间。
+```
+
+```text
+cham size visual 0.05
+# cham：主命令。
+# size：体型功能。
+# visual：回退模式；主要改 Actor scale，并把动态胶囊设置恢复基线。
+# 0.05：目标体型倍率；如果 physical 模式和某些地图机关冲突，可以临时用这个模式对比。
 ```
 
 ```text
@@ -191,6 +231,13 @@ cham size status
 # cham：主命令。
 # size：体型功能。
 # status：查看体型开关、目标体型、本地 Pawn 当前 scale。
+```
+
+```text
+cham size debug
+# cham：主命令。
+# size：体型功能。
+# debug：打印 Actor scale、BodyCapsule、OverapCollision、DynamicCapsule、DynamicSettings 当前数值。
 ```
 
 ```text
@@ -631,6 +678,7 @@ local DEFAULTS = {
     DisablePaintViewLock = true, -- DisablePaintViewLock：默认解除绘画视角锁。
     BodyScaleEnabled = false,    -- BodyScaleEnabled：默认不持续改体型。
     BodyScale = 1.0,             -- BodyScale：默认体型倍率。
+    BodyScaleMode = "physical",  -- BodyScaleMode：默认同步视觉缩放、碰撞胶囊、动态胶囊和脚底补偿。
     VisionEnabled = false,       -- VisionEnabled：默认不启用全局视觉。
     VisionMode = "glow",         -- VisionMode：默认身体发光。
     VisionTarget = "all",        -- VisionTarget：默认目标为全部远程玩家。
@@ -796,8 +844,8 @@ end)
 | --- | --- | --- |
 | 控制台命令 | UE4SS `RegisterConsoleCommandHandler` 注册 `cham` 和 `chameleon` | `Mods/ChameleonQoL/Scripts/main.lua` |
 | 本地 Pawn 获取 | 通过 UEHelpers/PlayerController 取当前 Pawn，每次命令重新取 | `get_local_pawn()` |
-| 体型修改 | 只对本地 Pawn 调 `SetActorScale3D(FVector)` | `Engine.hpp::SetActorScale3D` |
-| 体型状态 | 读取本地 Pawn `GetActorScale3D()` | `Engine.hpp::GetActorScale3D` |
+| 体型修改 | 默认 physical 模式：本地 Pawn `SetActorScale3D` + 胶囊体 + DynamicCapsule + 脚底补偿 | `Engine.hpp::SetActorScale3D`、`UCapsuleComponent::SetCapsuleSize`、`DynamicCapsuleHeightControl` |
+| 体型状态 | 读取本地 Pawn `GetActorScale3D()`，`cham size debug` 额外打印胶囊和动态胶囊尺寸 | `Engine.hpp::GetActorScale3D` |
 | 相机 FOV | 修改本地相机组件/角色字段 | `FirstPersonCamera`、`CameraFOV` |
 | 第三人称距离 | 修改角色第三人称距离字段/相机臂相关字段 | `TPS_CameraDistance`、`SpringArm` |
 | 移动倍率 | 修改本地角色 `MoveSpeedMultiply` | `BP_FirstPersonCharacter_Main.hpp` |
@@ -928,6 +976,23 @@ cham size 1.35
 # 1.35：重新设置目标体型并开启持续应用。
 ```
 
+如果要测试超小体型：
+
+```text
+cham size physical 0.05
+# cham：主命令。
+# size：体型功能。
+# physical：同步视觉和物理胶囊。
+# 0.05：超小体型倍率。
+```
+
+```text
+cham size debug
+# cham：主命令。
+# size：体型功能。
+# debug：确认 BodyCapsule、OverapCollision、DynamicCapsule 是否真的变小。
+```
+
 如果刚进房间或刚换角色样式，等角色完全生成后再执行。脚本已经避免缓存旧 Pawn，但游戏自身生成时序仍然可能晚于命令输入。
 
 ### `cham size` 改到了别人吗
@@ -937,6 +1002,7 @@ cham size 1.35
 - 体型命令每次先取本地 `PlayerController.Pawn`。
 - 不遍历 GameState 玩家数组去改 scale。
 - 不调用 `Server`、`Replicate`、`NetMulticast` 这类网络函数。
+- physical 模式只同步你自己的 `BodyCapsule`、`OverapCollision`、`DynamicCapsuleHeightControl`。
 
 验证：
 
@@ -950,6 +1016,37 @@ cham players
 cham status
 # cham：主命令。
 # status：看本地 Pawn 名称和当前 scale。
+```
+
+### 体型变小后脚还是悬空，或者进不了老鼠洞
+
+先执行：
+
+```text
+cham size physical 0.05
+# cham：主命令。
+# size：体型功能。
+# physical：强制使用物理体型模式。
+# 0.05：超小体型倍率，用来测试低矮洞口。
+```
+
+```text
+cham size debug
+# cham：主命令。
+# size：体型功能。
+# debug：打印 BodyCapsule、OverapCollision、DynamicCapsule、DynamicSettings 当前尺寸。
+```
+
+如果 `debug` 里 `BodyCapsule` 已经很小，但还是进不去，通常是洞口用了额外阻挡体、地图碰撞厚度、交互触发器或导航限制。下一步可以继续单独做 `noclip` / 碰撞通道调试命令。
+
+如果 `DynamicCapsule` 或 `DynamicSettings` 没有变小，说明当前角色样式没有暴露同名组件或游戏更新改了字段名，需要重新 dump 后查：
+
+```text
+rg -n "DynamicCapsuleHeightControl|DynamicCapsuleHeightSettings|BodyCapsule|OverapCollision" CXXHeaderDump UE4SS_ObjectDump.txt
+# rg：快速搜索工具。
+# -n：显示行号。
+# "DynamicCapsuleHeightControl|DynamicCapsuleHeightSettings|BodyCapsule|OverapCollision"：要搜索的体型/胶囊关键词。
+# CXXHeaderDump UE4SS_ObjectDump.txt：搜索 dump 出来的 C++ header 和对象索引。
 ```
 
 ### 能列出玩家，但 vision 没有发光
@@ -1146,6 +1243,7 @@ rg -n "BP_GameState_cLeon|BP_PlayerController_cLeon|WBP_Nameplate" UE4SS_ObjectD
 - 游戏内 `~` / `F10` 可打开 Unreal 内置控制台。
 - 可以进入局域网房间。
 - `cham size` 可以修改本地体型。
+- `cham size physical <正数>` 会同步视觉体型、碰撞胶囊、动态胶囊高度和脚底补偿。
 - `cham vision on` 可以让其他玩家身体出现红色呼吸式发光。
 - 当前脚本不会永久保存功能配置。
 - `ChameleonDiscovery` 默认关闭，避免日常启动刷日志。

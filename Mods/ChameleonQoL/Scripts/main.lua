@@ -13,6 +13,7 @@ local DEFAULTS = {
     DisablePaintViewLock = true,
     BodyScaleEnabled = false,
     BodyScale = 1.0,
+    BodyScaleMode = "physical",
     VisionEnabled = false,
     VisionMode = "glow",
     VisionTarget = "all",
@@ -24,6 +25,8 @@ local CONFIG = {}
 local last_config_signature = ""
 local last_pawn_name = ""
 local last_apply_signature = ""
+local BODY_BASELINES = {}
+local BODY_LAST_APPLIED = {}
 local VISION_MARKED_ACTORS = {}
 local VISION_FORCED_NAMEPLATES = {}
 
@@ -110,6 +113,7 @@ local function set_defaults()
     CONFIG.DisablePaintViewLock = DEFAULTS.DisablePaintViewLock
     CONFIG.BodyScaleEnabled = DEFAULTS.BodyScaleEnabled
     CONFIG.BodyScale = DEFAULTS.BodyScale
+    CONFIG.BodyScaleMode = DEFAULTS.BodyScaleMode
     CONFIG.VisionEnabled = DEFAULTS.VisionEnabled
     CONFIG.VisionMode = DEFAULTS.VisionMode
     CONFIG.VisionTarget = DEFAULTS.VisionTarget
@@ -118,7 +122,7 @@ local function set_defaults()
 end
 
 local function current_config_signature()
-    return string.format("%s|%.2f|%.2f|%.2f|%.2f|%.2f|%s|%s|%.2f|%s|%s|%s|%d|%d",
+    return string.format("%s|%.2f|%.2f|%.2f|%.2f|%.2f|%s|%s|%.6f|%s|%s|%s|%s|%d|%d",
         tostring(CONFIG.Enabled),
         CONFIG.CameraFOV,
         CONFIG.FirstPersonFOV,
@@ -128,6 +132,7 @@ local function current_config_signature()
         tostring(CONFIG.DisablePaintViewLock),
         tostring(CONFIG.BodyScaleEnabled),
         CONFIG.BodyScale,
+        CONFIG.BodyScaleMode,
         tostring(CONFIG.VisionEnabled),
         CONFIG.VisionMode,
         CONFIG.VisionTarget,
@@ -335,6 +340,431 @@ local function get_actor_scale(pawn)
     end)
 end
 
+local function finite_positive_number(value)
+    local parsed = tonumber(value)
+    if parsed == nil then
+        return nil
+    end
+    if parsed ~= parsed or parsed == math.huge or parsed == -math.huge or parsed <= 0 then
+        return nil
+    end
+    return parsed
+end
+
+local function vector_axis(vector, axis, fallback)
+    if not vector then
+        return fallback
+    end
+
+    local ok, value = pcall(function()
+        return vector[axis]
+    end)
+
+    if ok and tonumber(value) then
+        return tonumber(value)
+    end
+
+    return fallback
+end
+
+local function get_actor_scale_x(pawn)
+    local scale = get_actor_scale(pawn)
+    return vector_axis(scale, "X", 1.0)
+end
+
+local function get_capsule_metrics(capsule)
+    if not is_valid_object(capsule) then
+        return nil
+    end
+
+    local metrics = {}
+    metrics.object = capsule
+    metrics.name = fullname(capsule)
+    metrics.unscaled_radius = safe("GetUnscaledCapsuleRadius", function()
+        return capsule:GetUnscaledCapsuleRadius()
+    end)
+    metrics.unscaled_half_height = safe("GetUnscaledCapsuleHalfHeight", function()
+        return capsule:GetUnscaledCapsuleHalfHeight()
+    end)
+    metrics.scaled_radius = safe("GetScaledCapsuleRadius", function()
+        return capsule:GetScaledCapsuleRadius()
+    end)
+    metrics.scaled_half_height = safe("GetScaledCapsuleHalfHeight", function()
+        return capsule:GetScaledCapsuleHalfHeight()
+    end)
+    return metrics
+end
+
+local function read_dynamic_capsule_height(component, method_name)
+    if not is_valid_object(component) then
+        return nil
+    end
+
+    local ok, value = call_method(component, method_name)
+    if ok and tonumber(value) then
+        return tonumber(value)
+    end
+    return nil
+end
+
+local function get_dynamic_capsule_metrics(component)
+    if not is_valid_object(component) then
+        return nil
+    end
+
+    return {
+        object = component,
+        name = fullname(component),
+        current = read_dynamic_capsule_height(component, "GetDynamicCapsuleCurrentHalfHeight") or
+            read_dynamic_capsule_height(component, "GetCurrentCapsuleHalfHeight"),
+        desired = read_dynamic_capsule_height(component, "GetDynamicCapsuleDesiredHalfHeight") or
+            read_dynamic_capsule_height(component, "GetDesiredCapsuleHalfHeight"),
+        standing = read_dynamic_capsule_height(component, "GetDynamicCapsuleStandingHalfHeight"),
+        crouching = read_dynamic_capsule_height(component, "GetDynamicCapsuleCrouchingHalfHeight"),
+    }
+end
+
+local function pawn_key(pawn)
+    return fullname(pawn)
+end
+
+local function object_path(full_name)
+    local text = tostring(full_name or "")
+    return text:match("%s(.+)$") or text
+end
+
+local function find_dynamic_capsule_settings(pawn)
+    if not is_valid_object(pawn) then
+        return nil
+    end
+
+    local mover = read_property(pawn, "ExtendedPhysicsCharacterMoverComponent")
+    if is_valid_object(mover) then
+        for _, property_name in ipairs({"DynamicCapsuleHeightSettings", "DynamicCapsuleHeightSettings_0"}) do
+            local settings = read_property(mover, property_name)
+            if is_valid_object(settings) then
+                return settings
+            end
+        end
+    end
+
+    local pawn_path = object_path(fullname(pawn))
+    local settings_list = safe("FindAllOf DynamicCapsuleHeightSettings", function()
+        return FindAllOf("DynamicCapsuleHeightSettings")
+    end)
+
+    local matched = nil
+    for_each_array(settings_list, function(settings)
+        if matched or not is_valid_object(settings) then
+            return
+        end
+
+        local settings_name = fullname(settings)
+        if settings_name:find(pawn_path, 1, true) then
+            matched = settings
+        end
+    end)
+
+    return matched
+end
+
+local function get_dynamic_capsule_settings_metrics(settings)
+    if not is_valid_object(settings) then
+        return nil
+    end
+
+    return {
+        object = settings,
+        name = fullname(settings),
+        standing = tonumber(read_property(settings, "StandingCapsuleHalfHeight")),
+        current = tonumber(read_property(settings, "CurrentCapsuleHalfHeightForGroundCheck")),
+        crouching = tonumber(read_property(settings, "CrouchingCapsuleHalfHeight")),
+        min = tonumber(read_property(settings, "MinCapsuleHalfHeight")),
+        max = tonumber(read_property(settings, "MaxCapsuleHalfHeight")),
+    }
+end
+
+local function capture_body_baseline(pawn)
+    local key = pawn_key(pawn)
+    if BODY_BASELINES[key] then
+        return BODY_BASELINES[key]
+    end
+
+    local baseline = {
+        pawn_name = key,
+        actor_scale = get_actor_scale_x(pawn),
+        default_capsule_height = tonumber(read_property(pawn, "DefaultCapsuleHeight")),
+        crouching_height = tonumber(read_property(pawn, "CrouchingHeight")),
+        body_capsule = get_capsule_metrics(read_property(pawn, "BodyCapsule")),
+        overlap_capsule = get_capsule_metrics(read_property(pawn, "OverapCollision")),
+        dynamic_capsule = get_dynamic_capsule_metrics(read_property(pawn, "DynamicCapsuleHeightControl")),
+        dynamic_settings = get_dynamic_capsule_settings_metrics(find_dynamic_capsule_settings(pawn)),
+    }
+
+    local fallback_half = nil
+    if baseline.body_capsule and tonumber(baseline.body_capsule.unscaled_half_height) then
+        fallback_half = tonumber(baseline.body_capsule.unscaled_half_height)
+    elseif baseline.dynamic_capsule and tonumber(baseline.dynamic_capsule.current) then
+        fallback_half = tonumber(baseline.dynamic_capsule.current)
+    elseif baseline.dynamic_settings and tonumber(baseline.dynamic_settings.current) then
+        fallback_half = tonumber(baseline.dynamic_settings.current)
+    elseif baseline.default_capsule_height then
+        fallback_half = baseline.default_capsule_height
+    else
+        fallback_half = 88.0
+    end
+
+    baseline.base_half_height = fallback_half
+    baseline.base_crouch_half_height = baseline.crouching_height or
+        (baseline.dynamic_capsule and baseline.dynamic_capsule.crouching) or
+        (fallback_half * 0.5)
+
+    BODY_BASELINES[key] = baseline
+    return baseline
+end
+
+local function set_capsule_from_baseline(capsule, metrics)
+    if not is_valid_object(capsule) or not metrics then
+        return false
+    end
+
+    local radius = tonumber(metrics.unscaled_radius)
+    local half_height = tonumber(metrics.unscaled_half_height)
+    if not radius or not half_height then
+        return false
+    end
+
+    -- Actor scale handles the final world size. Keep local capsule dimensions at baseline
+    -- so the capsule is not scaled twice.
+    local ok, err = pcall(function()
+        capsule:SetCapsuleSize(radius, half_height, true)
+    end)
+
+    if not ok then
+        append("SetCapsuleSize failed on " .. fullname(capsule) .. ": " .. tostring(err))
+        return false
+    end
+
+    return true
+end
+
+local function set_dynamic_capsule_height(component, baseline, scale)
+    if not is_valid_object(component) then
+        return 0
+    end
+
+    local changed = 0
+    local standing = (baseline.dynamic_capsule and baseline.dynamic_capsule.standing) or baseline.base_half_height
+    local desired = (baseline.dynamic_capsule and baseline.dynamic_capsule.desired) or standing
+    local crouching = (baseline.dynamic_capsule and baseline.dynamic_capsule.crouching) or baseline.base_crouch_half_height
+
+    local targets = {
+        {"SetDynamicCapsuleStandingHalfHeight", standing * scale},
+        {"SetDynamicCapsuleDesiredHalfHeight", desired * scale},
+        {"SetDynamicCapsuleCrouchingHalfHeight", crouching * scale},
+        {"SetDesiredCapsuleHalfHeight", desired * scale},
+    }
+
+    for _, item in ipairs(targets) do
+        local ok = call_method(component, item[1], item[2])
+        if ok then
+            changed = changed + 1
+        end
+    end
+
+    return changed
+end
+
+local function set_dynamic_capsule_settings(settings, baseline, scale)
+    if not is_valid_object(settings) then
+        return 0
+    end
+
+    local source = baseline.dynamic_settings or {}
+    local base_half = baseline.base_half_height or 88.0
+    local standing = (source.standing or base_half) * scale
+    local current = (source.current or source.standing or base_half) * scale
+    local crouching = (source.crouching or baseline.base_crouch_half_height or (base_half * 0.5)) * scale
+    local min_height = math.max(0.001, math.min(standing, crouching) * 0.05)
+    local max_height = math.max(standing, crouching, (source.max or base_half) * math.max(scale, 1.0))
+
+    local changed = 0
+    local values = {
+        StandingCapsuleHalfHeight = standing,
+        CurrentCapsuleHalfHeightForGroundCheck = current,
+        CrouchingCapsuleHalfHeight = crouching,
+        MinCapsuleHalfHeight = min_height,
+        MaxCapsuleHalfHeight = max_height,
+    }
+
+    for property_name, value in pairs(values) do
+        if try_set_property(settings, property_name, value) then
+            changed = changed + 1
+        end
+    end
+
+    return changed
+end
+
+local function teleport_actor_by_z(pawn, delta_z)
+    if math.abs(delta_z or 0.0) < 0.001 then
+        return false
+    end
+
+    local location = safe("K2_GetActorLocation", function()
+        return pawn:K2_GetActorLocation()
+    end)
+    if not location then
+        return false
+    end
+
+    local rotation = safe("K2_GetActorRotation", function()
+        return pawn:K2_GetActorRotation()
+    end)
+
+    local new_location = make_vector(
+        vector_axis(location, "X", 0.0),
+        vector_axis(location, "Y", 0.0),
+        vector_axis(location, "Z", 0.0) + delta_z)
+
+    local ok = false
+    if rotation then
+        ok = safe("K2_TeleportTo", function()
+            return pawn:K2_TeleportTo(new_location, rotation)
+        end) == true
+    end
+
+    if not ok then
+        local root = read_property(pawn, "RootComponent")
+        if is_valid_object(root) then
+            ok = safe("RootComponent:K2_SetWorldLocation", function()
+                return root:K2_SetWorldLocation(new_location, false, {}, true)
+            end) == true
+        end
+    end
+
+    return ok
+end
+
+local function compensate_feet(pawn, baseline, scale, quiet, old_scale_override)
+    local key = pawn_key(pawn)
+    local previous = BODY_LAST_APPLIED[key]
+    local old_scale = old_scale_override or (previous and previous.scale) or get_actor_scale_x(pawn)
+    if math.abs(old_scale - scale) < 0.000001 then
+        return 0.0
+    end
+
+    local base_half = baseline.base_half_height or 88.0
+    local delta_z = (base_half * scale) - (base_half * old_scale)
+    if teleport_actor_by_z(pawn, delta_z) then
+        return delta_z
+    end
+
+    if not quiet then
+        append(string.format("foot compensation failed: pawn=%s old_scale=%.6f new_scale=%.6f delta_z=%.2f",
+            key, old_scale, scale, delta_z))
+    end
+    return 0.0
+end
+
+local function reset_body_physics(pawn, baseline)
+    if not is_valid_object(pawn) or not baseline then
+        return
+    end
+
+    set_capsule_from_baseline(read_property(pawn, "BodyCapsule"), baseline.body_capsule)
+    set_capsule_from_baseline(read_property(pawn, "OverapCollision"), baseline.overlap_capsule)
+
+    local settings = find_dynamic_capsule_settings(pawn)
+    if is_valid_object(settings) and baseline.dynamic_settings then
+        for _, item in ipairs({
+            {"StandingCapsuleHalfHeight", baseline.dynamic_settings.standing},
+            {"CurrentCapsuleHalfHeightForGroundCheck", baseline.dynamic_settings.current},
+            {"CrouchingCapsuleHalfHeight", baseline.dynamic_settings.crouching},
+            {"MinCapsuleHalfHeight", baseline.dynamic_settings.min},
+            {"MaxCapsuleHalfHeight", baseline.dynamic_settings.max},
+        }) do
+            if item[2] ~= nil then
+                try_set_property(settings, item[1], item[2])
+            end
+        end
+    end
+
+    local dynamic = read_property(pawn, "DynamicCapsuleHeightControl")
+    if is_valid_object(dynamic) then
+        set_dynamic_capsule_height(dynamic, baseline, 1.0)
+        call_method(dynamic, "ClearDynamicCapsuleDesiredHalfHeight")
+        call_method(dynamic, "ClearDesiredCapsuleHalfHeight")
+        call_method(dynamic, "SetDynamicCapsuleCrouching", false)
+    end
+end
+
+local function body_debug_lines(pawn)
+    local lines = {}
+    if not is_valid_object(pawn) then
+        table.insert(lines, "体型诊断：当前还没有本地 Pawn。")
+        return lines
+    end
+
+    local baseline = capture_body_baseline(pawn)
+    table.insert(lines, "体型诊断 Pawn=" .. fullname(pawn))
+    table.insert(lines, string.format("  actor_scale=(%s)，baseline_half=%.2f，mode=%s，target=%.6f",
+        vector_to_string(get_actor_scale(pawn)),
+        baseline.base_half_height or -1.0,
+        CONFIG.BodyScaleMode,
+        CONFIG.BodyScale))
+
+    local capsules = {
+        {"BodyCapsule", get_capsule_metrics(read_property(pawn, "BodyCapsule"))},
+        {"OverapCollision", get_capsule_metrics(read_property(pawn, "OverapCollision"))},
+    }
+
+    for _, item in ipairs(capsules) do
+        local name, metrics = item[1], item[2]
+        if metrics then
+            table.insert(lines, string.format("  %s：unscaled radius=%.2f half=%.2f；scaled radius=%.2f half=%.2f",
+                name,
+                tonumber(metrics.unscaled_radius) or -1.0,
+                tonumber(metrics.unscaled_half_height) or -1.0,
+                tonumber(metrics.scaled_radius) or -1.0,
+                tonumber(metrics.scaled_half_height) or -1.0))
+        else
+            table.insert(lines, "  " .. name .. "：<invalid>")
+        end
+    end
+
+    local dynamic = get_dynamic_capsule_metrics(read_property(pawn, "DynamicCapsuleHeightControl"))
+    if dynamic then
+        table.insert(lines, string.format("  DynamicCapsule：current=%.2f desired=%.2f standing=%.2f crouching=%.2f",
+            tonumber(dynamic.current) or -1.0,
+            tonumber(dynamic.desired) or -1.0,
+            tonumber(dynamic.standing) or -1.0,
+            tonumber(dynamic.crouching) or -1.0))
+    else
+        table.insert(lines, "  DynamicCapsule：<invalid>")
+    end
+
+    local settings = get_dynamic_capsule_settings_metrics(find_dynamic_capsule_settings(pawn))
+    if settings then
+        table.insert(lines, string.format("  DynamicSettings：current=%.2f standing=%.2f crouching=%.2f min=%.4f max=%.2f",
+            tonumber(settings.current) or -1.0,
+            tonumber(settings.standing) or -1.0,
+            tonumber(settings.crouching) or -1.0,
+            tonumber(settings.min) or -1.0,
+            tonumber(settings.max) or -1.0))
+    else
+        table.insert(lines, "  DynamicSettings：<invalid>")
+    end
+
+    return lines
+end
+
+local function print_body_debug(ar, pawn)
+    for _, line in ipairs(body_debug_lines(pawn or get_local_pawn())) do
+        console(ar, line)
+    end
+end
+
 local function set_actor_scale(pawn, scale, ar, reason, quiet)
     if not is_valid_object(pawn) then
         if not quiet then
@@ -343,6 +773,8 @@ local function set_actor_scale(pawn, scale, ar, reason, quiet)
         return false
     end
 
+    local baseline = capture_body_baseline(pawn)
+    local old_actor_scale = get_actor_scale_x(pawn)
     local before = nil
     if not quiet then
         before = get_actor_scale(pawn)
@@ -376,14 +808,44 @@ local function set_actor_scale(pawn, scale, ar, reason, quiet)
     end
 
     if ok then
+        local capsule_changed = 0
+        local dynamic_changed = 0
+        local settings_changed = 0
+        local foot_delta = 0.0
+        local mode = CONFIG.BodyScaleMode or DEFAULTS.BodyScaleMode
+
+        if mode == "physical" then
+            if set_capsule_from_baseline(read_property(pawn, "BodyCapsule"), baseline.body_capsule) then
+                capsule_changed = capsule_changed + 1
+            end
+            if set_capsule_from_baseline(read_property(pawn, "OverapCollision"), baseline.overlap_capsule) then
+                capsule_changed = capsule_changed + 1
+            end
+            dynamic_changed = set_dynamic_capsule_height(read_property(pawn, "DynamicCapsuleHeightControl"), baseline, scale)
+            settings_changed = set_dynamic_capsule_settings(find_dynamic_capsule_settings(pawn), baseline, scale)
+            foot_delta = compensate_feet(pawn, baseline, scale, quiet, old_actor_scale)
+        else
+            reset_body_physics(pawn, baseline)
+        end
+
+        BODY_LAST_APPLIED[pawn_key(pawn)] = {
+            scale = scale,
+            mode = mode,
+        }
+
         if not quiet then
             local after = get_actor_scale(pawn)
-            console(ar, string.format("体型已应用到本地 Pawn：scale=%.2f，原因=%s，Pawn=%s，修改前=(%s)，修改后=(%s)",
+            console(ar, string.format("体型已应用到本地 Pawn：scale=%.6f，模式=%s，原因=%s，Pawn=%s，修改前=(%s)，修改后=(%s)，胶囊=%d，动态胶囊=%d，动态设置=%d，脚底补偿Z=%.2f",
                 scale,
+                mode,
                 reason,
                 fullname(pawn),
                 vector_to_string(before),
-                vector_to_string(after)))
+                vector_to_string(after),
+                capsule_changed,
+                dynamic_changed,
+                settings_changed,
+                foot_delta))
         end
         return true
     end
@@ -827,7 +1289,7 @@ local function apply_pawn(reason, ar)
     local apply_signature = pawn_name .. "|" .. config_signature
     if apply_signature ~= last_apply_signature then
         last_apply_signature = apply_signature
-        local message = string.format("applied reason=%s fov=%.1f fp_fov=%.1f tps=%.1f sensitivity=%.2f speed=%.2f paint_lock=%s body_scale=%s/%.2f",
+        local message = string.format("applied reason=%s fov=%.1f fp_fov=%.1f tps=%.1f sensitivity=%.2f speed=%.2f paint_lock=%s body_scale=%s/%s/%.6f",
             reason,
             CONFIG.CameraFOV,
             CONFIG.FirstPersonFOV,
@@ -836,6 +1298,7 @@ local function apply_pawn(reason, ar)
             CONFIG.MoveSpeedMultiply,
             CONFIG.DisablePaintViewLock and "off" or "unchanged",
             CONFIG.BodyScaleEnabled and "on" or "off",
+            CONFIG.BodyScaleMode,
             CONFIG.BodyScale)
         if ar then
             console(ar, message)
@@ -860,7 +1323,7 @@ local function status(ar)
         scale_text = vector_to_string(get_actor_scale(pawn))
     end
 
-    console(ar, string.format("状态：启用=%s，FOV=%.1f，第一人称FOV=%.1f，第三人称距离=%.1f，鼠标灵敏度=%.2f，移动倍率=%.2f，绘画视角=%s，体型持续应用=%s，目标体型=%.2f，当前体型=(%s)",
+    console(ar, string.format("状态：启用=%s，FOV=%.1f，第一人称FOV=%.1f，第三人称距离=%.1f，鼠标灵敏度=%.2f，移动倍率=%.2f，绘画视角=%s，体型持续应用=%s，体型模式=%s，目标体型=%.6f，当前体型=(%s)",
         tostring(CONFIG.Enabled),
         CONFIG.CameraFOV,
         CONFIG.FirstPersonFOV,
@@ -869,6 +1332,7 @@ local function status(ar)
         CONFIG.MoveSpeedMultiply,
         CONFIG.DisablePaintViewLock and "解锁" or "游戏默认",
         CONFIG.BodyScaleEnabled and "开" or "关",
+        CONFIG.BodyScaleMode,
         CONFIG.BodyScale,
         scale_text))
     console(ar, string.format("全局视觉：%s，目标=%s，模式=%s，Stencil=%d，本次已标记=%d",
@@ -898,8 +1362,11 @@ local function help(ar)
     console(ar, "  cham set sens <0.1-5>               设置鼠标灵敏度，例如：cham set sens 1.2")
     console(ar, "  cham set speed <0.1-3>              设置本地移动倍率，例如：cham set speed 1.15")
     console(ar, "  cham paint unlock/default           解锁绘画视角锁定，或恢复游戏默认处理。")
-    console(ar, "  cham size <0.2-5>                   设置自身体型倍率并持续应用，例如：cham size 1.35")
+    console(ar, "  cham size <正数>                    设置自身体型倍率并持续应用，无上限限制，例如：cham size 0.05 / 2000")
+    console(ar, "  cham size physical <正数>           默认模式：同步视觉缩放、碰撞胶囊、动态胶囊高度和脚底补偿。")
+    console(ar, "  cham size visual <正数>             只改 Actor 视觉 scale，并重置体型碰撞；用于 physical 模式出问题时临时回退。")
     console(ar, "  cham size status                    只查看当前体型配置和本地 Pawn 当前 scale。")
+    console(ar, "  cham size debug                     打印 BodyCapsule、OverapCollision、DynamicCapsule 的当前尺寸。")
     console(ar, "  cham size apply                     重新获取本地 Pawn，并按当前体型倍率应用一次。")
     console(ar, "  cham size off                       停止后续持续体型应用，但不还原当前体型。")
     console(ar, "  cham size reset                     把当前本地 Pawn 体型还原为 1.0，并关闭持续体型应用。")
@@ -915,7 +1382,7 @@ end
 
 local function startup_help()
     console(nil, "ChameleonQoL 已加载。配置只在本次游戏进程生效，不会永久保存；输入 cham 查看完整中文教程。")
-    console(nil, "常用：cham status | cham apply | cham size 1.35 | cham size reset | cham vision on")
+    console(nil, "常用：cham status | cham apply | cham size 0.05 | cham size debug | cham size reset | cham vision on")
     console(nil, "相机：cham set fov 105 | cham set tps 560 | 移动：cham set speed 1.15 | 绘画：cham paint unlock")
     console(nil, "全局视觉：cham players | cham vision mode glow | cham vision target all | cham vision off")
 end
@@ -925,8 +1392,11 @@ local function handle_size_command(ar, parameters)
     local pawn = get_local_pawn()
 
     if action == "status" or action == "help" or action == "?" then
-        console(ar, "体型命令：cham size <0.2-5> / cham size apply / cham size off / cham size reset")
+        console(ar, "体型命令：cham size <正数> / cham size physical <正数> / cham size visual <正数> / cham size debug / cham size reset")
         status(ar)
+        return true
+    elseif action == "debug" or action == "diag" or action == "diagnose" then
+        print_body_debug(ar, pawn)
         return true
     elseif action == "apply" then
         if CONFIG.BodyScaleEnabled then
@@ -942,15 +1412,22 @@ local function handle_size_command(ar, parameters)
     elseif action == "reset" then
         CONFIG.BodyScaleEnabled = false
         CONFIG.BodyScale = 1.0
+        CONFIG.BodyScaleMode = DEFAULTS.BodyScaleMode
         set_actor_scale(pawn, 1.0, ar, "console-size-reset")
         return true
+    elseif action == "physical" or action == "phys" then
+        CONFIG.BodyScaleMode = "physical"
+        action = parameters[3] or tostring(CONFIG.BodyScale)
+    elseif action == "visual" or action == "actor" then
+        CONFIG.BodyScaleMode = "visual"
+        action = parameters[3] or tostring(CONFIG.BodyScale)
     elseif action == "set" then
         action = parameters[3] or ""
     end
 
-    local scale = number_value(action, nil, 0.2, 5.0)
+    local scale = finite_positive_number(action)
     if not scale then
-        console(ar, "体型参数无效。用法：cham size <0.2-5>，例如：cham size 1.35")
+        console(ar, "体型参数无效。用法：cham size <正数>，例如：cham size 0.05 / cham size 1.35 / cham size 2000")
         return true
     end
 
