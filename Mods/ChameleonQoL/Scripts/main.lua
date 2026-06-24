@@ -27,6 +27,7 @@ local last_pawn_name = ""
 local last_apply_signature = ""
 local BODY_BASELINES = {}
 local BODY_LAST_APPLIED = {}
+local RANDOM_SEEDED = false
 local VISION_MARKED_ACTORS = {}
 local VISION_FORCED_NAMEPLATES = {}
 
@@ -1370,6 +1371,7 @@ local function help(ar)
     console(ar, "  cham size apply                     重新获取本地 Pawn，并按当前体型倍率应用一次。")
     console(ar, "  cham size off                       停止后续持续体型应用，但不还原当前体型。")
     console(ar, "  cham size reset                     把当前本地 Pawn 体型还原为 1.0，并关闭持续体型应用。")
+    console(ar, "  cham setrandomplayersize <正数>     随机选择一位其他玩家改体型；排除自己；尽可能请求全房间可见。")
     console(ar, "  cham players                        列出当前可定位到的玩家、阵营、角色 Actor。")
     console(ar, "  cham vision on/off                  只在本机视角启用或关闭全局玩家身体位置显示。")
     console(ar, "  cham vision status                  查看全局视觉状态和当前可定位玩家。")
@@ -1383,6 +1385,7 @@ end
 local function startup_help()
     console(nil, "ChameleonQoL 已加载。配置只在本次游戏进程生效，不会永久保存；输入 cham 查看完整中文教程。")
     console(nil, "常用：cham status | cham apply | cham size 0.05 | cham size debug | cham size reset | cham vision on")
+    console(nil, "好友整活：cham setrandomplayersize 0.25 | cham setrandomplayersize 3")
     console(nil, "相机：cham set fov 105 | cham set tps 560 | 移动：cham set speed 1.15 | 绘画：cham paint unlock")
     console(nil, "全局视觉：cham players | cham vision mode glow | cham vision target all | cham vision off")
 end
@@ -1454,6 +1457,182 @@ local function print_players(ar)
 
     if #infos == 0 then
         console(ar, "还没有拿到玩家数据。先进入局域网房间，等角色生成后再执行 cham players。")
+    end
+
+    return true
+end
+
+local function seed_random_once()
+    if RANDOM_SEEDED then
+        return
+    end
+
+    math.randomseed(os.time())
+    math.random()
+    math.random()
+    RANDOM_SEEDED = true
+end
+
+local function has_authority(actor)
+    if not is_valid_object(actor) then
+        return false
+    end
+
+    local ok, result = pcall(function()
+        return actor:HasAuthority()
+    end)
+
+    return ok and result == true
+end
+
+local function force_actor_net_update(actor)
+    if not is_valid_object(actor) then
+        return 0
+    end
+
+    local changed = 0
+    if call_method(actor, "SetReplicates", true) then
+        changed = changed + 1
+    end
+    if call_method(actor, "SetReplicateMovement", true) then
+        changed = changed + 1
+    end
+    if call_method(actor, "SetNetUpdateFrequency", 100.0) then
+        changed = changed + 1
+    end
+    if call_method(actor, "SetMinNetUpdateFrequency", 30.0) then
+        changed = changed + 1
+    end
+    if call_method(actor, "ForceNetUpdate") then
+        changed = changed + 1
+    end
+
+    local components = {
+        read_property(actor, "RootComponent"),
+        read_property(actor, "BodyCapsule"),
+        read_property(actor, "OverapCollision"),
+        read_property(actor, "Mesh"),
+        read_property(actor, "FirstPersonMesh"),
+    }
+
+    for _, component in ipairs(components) do
+        if is_valid_object(component) and call_method(component, "SetIsReplicated", true) then
+            changed = changed + 1
+        end
+    end
+
+    return changed
+end
+
+local function try_replicated_scale_routes(actor, scale)
+    if not is_valid_object(actor) then
+        return 0
+    end
+
+    local attempts = 0
+    local baseline = capture_body_baseline(actor)
+    local target_half_height = (baseline.base_half_height or 88.0) * scale
+    local wants_crouch = scale < 1.0
+
+    -- These are best-effort. On a non-owner client, Unreal may drop Server RPCs.
+    if call_method(actor, "SetMeshDatas", true) then
+        attempts = attempts + 1
+    end
+    if call_method(actor, "CustomCrouch(Server)", target_half_height, wants_crouch) then
+        attempts = attempts + 1
+    end
+    if call_method(actor, "SetIsCrouching(Server)", wants_crouch) then
+        attempts = attempts + 1
+    end
+
+    local dynamic = read_property(actor, "DynamicCapsuleHeightControl")
+    if is_valid_object(dynamic) then
+        for _, item in ipairs({
+            {"ServerSetDesiredCapsuleHalfHeight", target_half_height},
+            {"MulticastSetDesiredCapsuleHalfHeight", target_half_height},
+            {"SetDesiredCapsuleHalfHeight", target_half_height},
+            {"SetDynamicCapsuleDesiredHalfHeight", target_half_height},
+            {"SetDynamicCapsuleStandingHalfHeight", target_half_height},
+            {"SetDynamicCapsuleCrouchingHalfHeight", math.max(0.001, target_half_height * 0.5)},
+        }) do
+            if call_method(dynamic, item[1], item[2]) then
+                attempts = attempts + 1
+            end
+        end
+    end
+
+    local mover = read_property(actor, "ExtendedPhysicsCharacterMoverComponent")
+    if is_valid_object(mover) then
+        for _, item in ipairs({
+            {"ServerSetDesiredCapsuleHalfHeight", target_half_height},
+            {"MulticastSetDesiredCapsuleHalfHeight", target_half_height},
+            {"SetDesiredCapsuleHalfHeight", target_half_height},
+        }) do
+            if call_method(mover, item[1], item[2]) then
+                attempts = attempts + 1
+            end
+        end
+    end
+
+    return attempts
+end
+
+local function remote_player_candidates()
+    local result = {}
+    local local_name = fullname(get_local_pawn())
+
+    for _, info in ipairs(get_player_infos()) do
+        if is_valid_object(info.character) and fullname(info.character) ~= local_name then
+            table.insert(result, info)
+        end
+    end
+
+    return result
+end
+
+local function handle_random_player_size_command(ar, parameters)
+    local scale = finite_positive_number(parameters[2])
+    if not scale then
+        console(ar, "用法：cham setrandomplayersize <正数>。例如：cham setrandomplayersize 0.25 或 cham setrandomplayersize 5")
+        return true
+    end
+
+    local candidates = remote_player_candidates()
+    if #candidates == 0 then
+        console(ar, "随机体型失败：当前没有可定位的其他玩家。先进入局域网房间，等其他玩家角色生成后再执行。")
+        return true
+    end
+
+    seed_random_once()
+    local target = candidates[math.random(1, #candidates)]
+    local actor = target.character
+    local authority = has_authority(actor)
+    local previous_mode = CONFIG.BodyScaleMode
+
+    CONFIG.BodyScaleMode = "physical"
+    local applied = set_actor_scale(actor, scale, ar, "console-random-player-size", false)
+    CONFIG.BodyScaleMode = previous_mode
+
+    local net_updates = 0
+    local replicated_attempts = 0
+    if applied then
+        replicated_attempts = try_replicated_scale_routes(actor, scale)
+        net_updates = force_actor_net_update(actor)
+    end
+
+    console(ar, string.format("随机玩家体型：name=%s role=%s scale=%.6f actor=%s authority=%s replicated_attempts=%d net_update_calls=%d",
+        target.name,
+        target.role,
+        scale,
+        fullname(actor),
+        tostring(authority),
+        replicated_attempts,
+        net_updates))
+
+    if not authority then
+        console(ar, "说明：当前客户端对目标 Actor 没有 authority；已尽可能尝试 Server/Multicast/NetUpdate 路线。如果其他人看不到，说明这些 RPC 被所有权校验拦住，还需要继续找游戏自带的客户端可请求复制入口。")
+    else
+        console(ar, "说明：已在有 authority 的 Actor 上修改并请求网络刷新；如果游戏没有复制 scale，可能仍需继续找游戏自己的复制入口。")
     end
 
     return true
@@ -1616,6 +1795,8 @@ local function handle_console_command(full_command, parameters, ar)
         return true
     elseif command == "size" or command == "body" or command == "scale" then
         return handle_size_command(ar, parameters)
+    elseif command == "setrandomplayersize" or command == "randomplayersize" or command == "randomsize" then
+        return handle_random_player_size_command(ar, parameters)
     elseif command == "players" or command == "player" then
         return print_players(ar)
     elseif command == "vision" or command == "esp" or command == "highlight" then

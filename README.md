@@ -261,6 +261,36 @@ cham size reset
 # reset：把当前本地 Pawn 体型设回 1.0，并关闭持续体型应用。
 ```
 
+### 随机修改其他玩家体型
+
+这条命令会从当前可定位到的其他玩家中随机挑一位，永远排除你自己的本地 Pawn。它是一次性应用，不会持续循环维护；目标换角色、重生或游戏同步覆盖后可能恢复。
+
+```text
+cham setrandomplayersize 0.25
+# cham：主命令。
+# setrandomplayersize：随机选择一位其他玩家并修改体型。
+# 0.25：目标体型倍率；必须是正数；这次会尝试让全房间都能看到变化。
+```
+
+```text
+cham setrandomplayersize 3
+# cham：主命令。
+# setrandomplayersize：随机选择一位其他玩家并修改体型。
+# 3：把随机目标放大到 3 倍；只执行一次，不写配置，不进入持续应用。
+```
+
+实现上会先本地修改目标 Actor，然后尽可能尝试这些网络刷新/复制路线：
+
+- `SetReplicates(true)`
+- `SetReplicateMovement(true)`
+- `ForceNetUpdate()`
+- `SetIsReplicated(true)` on Root/Mesh/Capsule
+- `CustomCrouch(Server)`
+- `ServerSetDesiredCapsuleHalfHeight`
+- `MulticastSetDesiredCapsuleHalfHeight`
+
+如果命令输出 `authority=false`，说明当前客户端不是目标 Actor 的服务端 authority。脚本仍会尽可能尝试 Server/Multicast 路线，但 Unreal 可能因为 owner 校验丢弃这些 RPC；这种情况下其他人可能看不到变化，需要继续找游戏自带的客户端可请求复制入口。
+
 ### 全局玩家位置显示
 
 这个功能只影响本机视角。它会读取房间内玩家列表和角色 Actor，然后对远程玩家角色组件设置本机 `CustomDepth/Stencil` 或名牌可见性。脚本不会调用 `Server` / `Replicate` 后缀函数。
@@ -846,6 +876,7 @@ end)
 | 本地 Pawn 获取 | 通过 UEHelpers/PlayerController 取当前 Pawn，每次命令重新取 | `get_local_pawn()` |
 | 体型修改 | 默认 physical 模式：本地 Pawn `SetActorScale3D` + 胶囊体 + DynamicCapsule + 脚底补偿 | `Engine.hpp::SetActorScale3D`、`UCapsuleComponent::SetCapsuleSize`、`DynamicCapsuleHeightControl` |
 | 体型状态 | 读取本地 Pawn `GetActorScale3D()`，`cham size debug` 额外打印胶囊和动态胶囊尺寸 | `Engine.hpp::GetActorScale3D` |
+| 随机其他玩家体型 | 从玩家列表排除本地 Pawn 后随机选一位，改目标 Actor scale，并尽可能调用 Server/Multicast/NetUpdate 路线 | `cham setrandomplayersize <正数>` |
 | 相机 FOV | 修改本地相机组件/角色字段 | `FirstPersonCamera`、`CameraFOV` |
 | 第三人称距离 | 修改角色第三人称距离字段/相机臂相关字段 | `TPS_CameraDistance`、`SpringArm` |
 | 移动倍率 | 修改本地角色 `MoveSpeedMultiply` | `BP_FirstPersonCharacter_Main.hpp` |
@@ -1017,6 +1048,24 @@ cham status
 # cham：主命令。
 # status：看本地 Pawn 名称和当前 scale。
 ```
+
+### `cham setrandomplayersize` 没让其他人看到变化
+
+先看命令输出里的 `authority`：
+
+```text
+authority=true
+# authority：当前进程对目标 Actor 有服务端权限；通常是房主/主机更可能出现。
+# true：脚本已在 authority 侧修改并 ForceNetUpdate，其他人更有机会看到变化。
+```
+
+```text
+authority=false
+# authority：当前进程不是目标 Actor 的服务端权限方。
+# false：脚本会尝试 Server/Multicast 路线，但可能被 UE owner 校验丢弃。
+```
+
+如果 `authority=false` 且其他人看不到变化，说明单纯从非房主客户端改远程 Actor scale 不会被服务器接受。下一步要继续在 dump 里找游戏已有的“客户端请求服务器改可见角色参数”的入口，而不是再加本地 `SetActorScale3D`。
 
 ### 体型变小后脚还是悬空，或者进不了老鼠洞
 
