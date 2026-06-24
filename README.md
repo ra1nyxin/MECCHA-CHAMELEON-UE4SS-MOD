@@ -295,6 +295,18 @@ cham setrandomplayersize 3
 
 这个功能只影响本机视角。它会读取房间内玩家列表和角色 Actor，然后对远程玩家角色组件设置本机 `CustomDepth/Stencil` 或名牌可见性。脚本不会调用 `Server` / `Replicate` 后缀函数。
 
+当前 `cham vision on` 默认按“尽量显示全部远程玩家”处理，包括游戏里暂时隐身、透明、被本地隐藏或不在正常视线内的玩家。实现上会同时做这些本地操作：
+
+- 从 `GameState` 的 `LiveSurvivors_PlayerState`、`HuntersPlayerState`、`PlayerArray` 读取 PlayerState。
+- 从 `GameState` 的 `Survivors`、`Hunters`、`LiveSurvivors_Controller` 读取 Controller，再反查 PlayerState/Pawn。
+- 使用 `FindAllOf("Character")` 兜底扫描本机已经存在的 `BP_FirstPersonCharacter_cLeon_Character`。
+- 调用游戏自带的 `ShowAllSurvivors` / `ShowAllSurvivors(Local)` 本地显示逻辑。
+- 对目标 Actor 临时设置 `SetActorHiddenInGame(false)`、`BodyVisibility=true`、`LocalFound=true`、`HideBlock=false`。
+- 对目标 `Mesh`、`BodyCapsule`、`OverapCollision`、`Sphere`、`FirstPersonMesh`、`RootComponent` 等组件临时设置 `SetHiddenInGame(false)`、`SetVisibility(true)`、`SetRenderInMainPass(true)` 和 `CustomDepth/Stencil`。
+- `cham vision off` 会按脚本记录的原始隐藏/可见状态、`CustomDepth` 和 `Stencil` 尽量恢复。
+
+注意：如果某个玩家 Actor 根本没有复制到你的客户端，本机没有那个 Actor，客户端脚本就没有可绘制对象。此时 `cham players` / `cham vision status` 也看不到该目标，需要继续找游戏的复制相关入口，而不是继续调 Stencil。
+
 ```text
 cham players
 # cham：主命令。
@@ -305,14 +317,14 @@ cham players
 cham vision on
 # cham：主命令。
 # vision：全局玩家位置显示功能。
-# on：启用全局玩家身体/名牌显示；默认模式是 glow。
+# on：启用全局玩家身体/名牌显示；默认模式是 glow，并尝试显示隐身/隐藏玩家。
 ```
 
 ```text
 cham vision off
 # cham：主命令。
 # vision：全局玩家位置显示功能。
-# off：关闭显示，并尝试清理脚本标记过的 CustomDepth/Stencil 和名牌状态。
+# off：关闭显示，并尝试清理脚本标记过的 CustomDepth/Stencil、名牌状态和临时可见性修改。
 ```
 
 ```text
@@ -326,7 +338,7 @@ cham vision status
 cham vision refresh
 # cham：主命令。
 # vision：全局玩家位置显示功能。
-# refresh：重新扫描玩家并立即应用一次；玩家加入、离开、重生后优先执行。
+# refresh：重新扫描玩家并立即应用一次；玩家加入、离开、重生、隐身状态变化后优先执行。
 ```
 
 ```text
@@ -802,11 +814,18 @@ end)
 | `CXXHeaderDump/BP_FirstPersonCharacter_cLeon_Character.hpp` | `SetStencilValue(Game)(int32 StencilValue)` | 游戏自己的 stencil 设置函数；名字带 Game，可能跟正常游戏逻辑绑定。 |
 | `CXXHeaderDump/BP_FirstPersonCharacter_cLeon_Character.hpp` | `SetStencilValue(Force)(int32 StencilValue)` | 强制设置 stencil 的蓝图函数；后续可继续研究。 |
 | `CXXHeaderDump/BP_FirstPersonCharacter_cLeon_Character.hpp` | `ShowAllSurvivors(Local)(...)` | 游戏已有“显示全部幸存者”本地函数，是全局视觉的重点研究入口。 |
+| `CXXHeaderDump/BP_FirstPersonCharacter_cLeon_Character.hpp` | `BodyVisibility` | 角色身体可见性字段；vision 会在本地临时设为 true，用于处理隐身/隐藏目标。 |
+| `CXXHeaderDump/BP_FirstPersonCharacter_cLeon_Character.hpp` | `LocalFound` | 本地发现状态字段；vision 会临时设为 true，辅助触发本地显示逻辑。 |
+| `CXXHeaderDump/BP_FirstPersonCharacter_cLeon_Character.hpp` | `HideBlock` | 隐藏阻断字段；vision 会临时设为 false，减少被本地隐藏逻辑挡住的情况。 |
+| `CXXHeaderDump/BP_FirstPersonCharacter_cLeon_Character.hpp` | `ForceShowBody()` | 游戏自带强制显示身体函数；vision 会对目标本地调用。 |
+| `CXXHeaderDump/BP_FirstPersonCharacter_cLeon_Character.hpp` | `OnRep_BodyVisibility()` | 身体可见性复制回调；本地改 `BodyVisibility` 后会调用它刷新状态。 |
 | `CXXHeaderDump/BPI_OutLine.hpp` | `View In Out Function` | 轮廓显示蓝图接口；可顺着查游戏自己的 outline 实现。 |
 | `CXXHeaderDump/Engine.hpp` | `SetRenderCustomDepth(bool bValue)` | 开关组件 CustomDepth 渲染。 |
 | `CXXHeaderDump/Engine.hpp` | `SetCustomDepthStencilValue(int32 Value)` | 设置 CustomDepth Stencil 值。 |
 | `CXXHeaderDump/Engine.hpp` | `SetHiddenInGame(bool NewHidden)` | 控制组件或 Actor 游戏内隐藏。 |
 | `CXXHeaderDump/Engine.hpp` | `SetVisibility(bool bNewVisibility, bool bPropagateToChildren)` | 控制组件可见性，可用于名牌/组件显示研究。 |
+| `CXXHeaderDump/Engine.hpp` | `SetActorHiddenInGame(bool bNewHidden)` | Actor 级隐藏开关；vision 会临时设为 false，并在关闭时尽量恢复。 |
+| `CXXHeaderDump/Engine.hpp` | `SetRenderInMainPass(bool bValue)` | 组件是否进入主渲染通道；隐藏/隐身目标需要临时打开，否则可能只有部分组件发光或完全不画。 |
 
 ### GameState 玩家列表和阵营
 
@@ -1140,6 +1159,36 @@ cham vision refresh
 ```
 
 如果当前地图后处理没有把该 Stencil 显示成明显颜色，换 `2`、`3`、`252` 继续试。
+
+### vision 只能看到一部分玩家或看不到隐身玩家
+
+新版 `vision` 默认会强制本地显示隐藏/隐身目标，但前提是目标 Actor 已经存在于你的客户端。先看这两条：
+
+```text
+cham players
+# cham：主命令。
+# players：打印当前客户端可定位到的玩家 Actor。
+```
+
+```text
+cham vision status
+# cham：主命令。
+# vision：全局玩家位置显示功能。
+# status：查看 vision 状态，并打印当前可定位玩家。
+```
+
+如果玩家不在列表里，说明本机没有拿到对应 Actor，通常是网络相关性、距离裁剪、游戏同步策略或目标还没生成。此时继续换 `stencil` 没意义，因为没有可标记的组件。下一步应该查 `GameState`、`PlayerController`、`PlayerState.TargetCharacter` 和复制相关函数。
+
+如果玩家在列表里但没发光，执行：
+
+```text
+cham vision refresh
+# cham：主命令。
+# vision：全局玩家位置显示功能。
+# refresh：重新扫描玩家，重新调用本地显示逻辑，并重新给组件打 CustomDepth/Stencil。
+```
+
+新版脚本会对目标 Actor/组件临时调用 `SetActorHiddenInGame(false)`、`SetHiddenInGame(false)`、`SetVisibility(true)`、`SetRenderInMainPass(true)`、`ForceShowBody()`、`OnRep_BodyVisibility()`，并在 `cham vision off` 时尽量恢复原状态。
 
 ### vision 开了以后想完全关掉
 

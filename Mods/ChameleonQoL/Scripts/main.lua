@@ -30,6 +30,7 @@ local BODY_LAST_APPLIED = {}
 local RANDOM_SEEDED = false
 local VISION_MARKED_ACTORS = {}
 local VISION_FORCED_NAMEPLATES = {}
+local VISION_VISIBILITY_STATES = {}
 
 local function console(ar, line)
     local text = "[ChameleonQoL] " .. line
@@ -926,6 +927,46 @@ local function get_player_character(player_state)
     return CreateInvalidObject()
 end
 
+local function get_controller_player_state(controller)
+    if not is_valid_object(controller) then
+        return CreateInvalidObject()
+    end
+
+    local player_state = read_property(controller, "PlayerState")
+    if is_valid_object(player_state) then
+        return player_state
+    end
+
+    local ok_player_state, result = pcall(function()
+        return controller:GetPlayerState()
+    end)
+    if ok_player_state and is_valid_object(result) then
+        return result
+    end
+
+    return CreateInvalidObject()
+end
+
+local function get_controller_pawn(controller)
+    if not is_valid_object(controller) then
+        return CreateInvalidObject()
+    end
+
+    local pawn = read_property(controller, "Pawn")
+    if is_valid_object(pawn) then
+        return pawn
+    end
+
+    local ok_pawn, result = pcall(function()
+        return controller:GetPawn()
+    end)
+    if ok_pawn and is_valid_object(result) then
+        return result
+    end
+
+    return CreateInvalidObject()
+end
+
 local function classify_player(role_hint, character)
     local name = string.lower(fullname(character))
     if string.find(name, "hunter", 1, true) then
@@ -961,9 +1002,45 @@ local function add_player_info(result, seen, player_state, role_hint)
     })
 end
 
+local function add_controller_info(result, seen, controller, role_hint)
+    if not is_valid_object(controller) then
+        return
+    end
+
+    local player_state = get_controller_player_state(controller)
+    if is_valid_object(player_state) then
+        add_player_info(result, seen, player_state, role_hint)
+        return
+    end
+
+    local character = get_controller_pawn(controller)
+    if not is_valid_object(character) then
+        return
+    end
+
+    local character_name = fullname(character)
+    if seen[character_name] then
+        return
+    end
+
+    seen[character_name] = true
+    table.insert(result, {
+        player_state = CreateInvalidObject(),
+        character = character,
+        name = fullname(controller),
+        role = classify_player(role_hint, character),
+    })
+end
+
 local function add_player_state_array(result, seen, array, role_hint)
     for_each_array(array, function(player_state)
         add_player_info(result, seen, player_state, role_hint)
+    end)
+end
+
+local function add_controller_array(result, seen, array, role_hint)
+    for_each_array(array, function(controller)
+        add_controller_info(result, seen, controller, role_hint)
     end)
 end
 
@@ -1004,6 +1081,9 @@ local function get_player_infos()
         add_player_state_array(result, seen, read_property(game_state, "LiveSurvivors_PlayerState"), "survivor")
         add_player_state_array(result, seen, read_property(game_state, "HuntersPlayerState"), "hunter")
         add_player_state_array(result, seen, read_property(game_state, "PlayerArray"), "player")
+        add_controller_array(result, seen, read_property(game_state, "Survivors"), "survivor")
+        add_controller_array(result, seen, read_property(game_state, "Hunters"), "hunter")
+        add_controller_array(result, seen, read_property(game_state, "LiveSurvivors_Controller"), "survivor")
     end
 
     add_character_fallbacks(result, seen)
@@ -1039,9 +1119,120 @@ local function vision_target_matches(info)
     return true
 end
 
+local function remember_visibility_state(object, kind)
+    if not is_valid_object(object) then
+        return nil
+    end
+
+    local key = fullname(object)
+    if VISION_VISIBILITY_STATES[key] then
+        return key
+    end
+
+    VISION_VISIBILITY_STATES[key] = {
+        object = object,
+        kind = kind,
+        bHidden = read_property(object, "bHidden"),
+        bHiddenInGame = read_property(object, "bHiddenInGame"),
+        bVisible = read_property(object, "bVisible"),
+        bRenderInMainPass = read_property(object, "bRenderInMainPass"),
+        bRenderCustomDepth = read_property(object, "bRenderCustomDepth"),
+        CustomDepthStencilValue = read_property(object, "CustomDepthStencilValue"),
+        BodyVisibility = read_property(object, "BodyVisibility"),
+        LocalFound = read_property(object, "LocalFound"),
+        HideBlock = read_property(object, "HideBlock"),
+    }
+
+    return key
+end
+
+local function restore_visibility_state_by_key(key)
+    local state = VISION_VISIBILITY_STATES[key]
+    if not state then
+        return
+    end
+
+    local object = state.object
+    if is_valid_object(object) then
+        if state.kind == "actor" then
+            if state.bHidden ~= nil then
+                call_method(object, "SetActorHiddenInGame", state.bHidden == true)
+                try_set_property(object, "bHidden", state.bHidden)
+            end
+            if state.BodyVisibility ~= nil then
+                try_set_property(object, "BodyVisibility", state.BodyVisibility)
+                call_method(object, "OnRep_BodyVisibility")
+            end
+            if state.LocalFound ~= nil then
+                try_set_property(object, "LocalFound", state.LocalFound)
+            end
+            if state.HideBlock ~= nil then
+                try_set_property(object, "HideBlock", state.HideBlock)
+            end
+        else
+            if state.bHiddenInGame ~= nil then
+                call_method(object, "SetHiddenInGame", state.bHiddenInGame == true, true)
+                try_set_property(object, "bHiddenInGame", state.bHiddenInGame)
+            end
+            if state.bVisible ~= nil then
+                call_method(object, "SetVisibility", state.bVisible == true, true)
+                try_set_property(object, "bVisible", state.bVisible)
+            end
+            if state.bRenderInMainPass ~= nil then
+                call_method(object, "SetRenderInMainPass", state.bRenderInMainPass == true)
+                try_set_property(object, "bRenderInMainPass", state.bRenderInMainPass)
+            end
+            if state.bRenderCustomDepth ~= nil then
+                call_method(object, "SetRenderCustomDepth", state.bRenderCustomDepth == true)
+                try_set_property(object, "bRenderCustomDepth", state.bRenderCustomDepth)
+            end
+            if state.CustomDepthStencilValue ~= nil then
+                call_method(object, "SetCustomDepthStencilValue", state.CustomDepthStencilValue)
+                try_set_property(object, "CustomDepthStencilValue", state.CustomDepthStencilValue)
+            end
+        end
+    end
+
+    VISION_VISIBILITY_STATES[key] = nil
+end
+
+local function force_actor_visible_for_vision(character)
+    if not is_valid_object(character) then
+        return
+    end
+
+    remember_visibility_state(character, "actor")
+    call_method(character, "SetActorHiddenInGame", false)
+    try_set_property(character, "bHidden", false)
+    try_set_property(character, "BodyVisibility", true)
+    try_set_property(character, "LocalFound", true)
+    try_set_property(character, "HideBlock", false)
+    call_method(character, "OnRep_BodyVisibility")
+    call_method(character, "AlpahUpdate")
+    call_method(character, "ForceShowBody")
+end
+
+local function force_component_visible_for_vision(component)
+    if not is_valid_object(component) then
+        return
+    end
+
+    remember_visibility_state(component, "component")
+    call_method(component, "SetHiddenInGame", false, true)
+    call_method(component, "SetVisibility", true, true)
+    call_method(component, "SetRenderInMainPass", true)
+    try_set_property(component, "bHiddenInGame", false)
+    try_set_property(component, "bVisible", true)
+    try_set_property(component, "bRenderInMainPass", true)
+end
+
 local function set_primitive_outline(component, enabled, stencil)
     if not is_valid_object(component) then
         return false
+    end
+
+    if enabled then
+        force_component_visible_for_vision(component)
     end
 
     local changed = false
@@ -1070,10 +1261,17 @@ local function set_character_glow(character, enabled, stencil)
     local component_names = {
         "Mesh",
         "BodyCapsule",
+        "OverapCollision",
         "Sphere",
         "FirstPersonMesh",
         "HandBone",
+        "RootComponent",
+        "RuntimePaintable",
     }
+
+    if enabled then
+        force_actor_visible_for_vision(character)
+    end
 
     for _, component_name in ipairs(component_names) do
         if set_primitive_outline(read_property(character, component_name), enabled, stencil) then
@@ -1095,6 +1293,7 @@ local function set_character_nameplate(character, display_name, enabled)
     local changed = false
 
     if enabled then
+        force_actor_visible_for_vision(character)
         try_set_property(character, "CurrentNamePlateVisibility", true)
         try_set_property(character, "NamePlateVisibilityType", 1)
         if display_name and display_name ~= "" then
@@ -1103,6 +1302,9 @@ local function set_character_nameplate(character, display_name, enabled)
     end
 
     if is_valid_object(nameplate) then
+        if enabled then
+            force_component_visible_for_vision(nameplate)
+        end
         pcall(function()
             nameplate:SetHiddenInGame(not enabled, true)
         end)
@@ -1116,6 +1318,33 @@ local function set_character_nameplate(character, display_name, enabled)
     return changed
 end
 
+local function restore_character_visibility(character)
+    if not is_valid_object(character) then
+        return
+    end
+
+    local component_names = {
+        "Mesh",
+        "BodyCapsule",
+        "OverapCollision",
+        "Sphere",
+        "FirstPersonMesh",
+        "HandBone",
+        "RootComponent",
+        "RuntimePaintable",
+        "Nameplate",
+    }
+
+    for _, component_name in ipairs(component_names) do
+        local component = read_property(character, component_name)
+        if is_valid_object(component) then
+            restore_visibility_state_by_key(fullname(component))
+        end
+    end
+
+    restore_visibility_state_by_key(fullname(character))
+end
+
 local function set_local_vision_controller_state(enabled)
     local controller = UEHelpers.GetPlayerController()
     if not is_valid_object(controller) then
@@ -1126,6 +1355,19 @@ local function set_local_vision_controller_state(enabled)
     try_set_property(controller, "GlobalNameplateVisibility", enabled and (CONFIG.VisionMode == "name" or CONFIG.VisionMode == "both"))
     call_method(controller, "CanPenterationUpdate", enabled)
     call_method(controller, "NamePlateVisibilityChange", enabled and (CONFIG.VisionMode == "name" or CONFIG.VisionMode == "both"))
+end
+
+local function apply_builtin_local_vision()
+    local game_state = UEHelpers.GetGameStateBase()
+    local local_pawn = get_local_pawn()
+
+    if is_valid_object(game_state) then
+        call_method(game_state, "ShowAllSurvivors")
+    end
+
+    if is_valid_object(local_pawn) and is_valid_object(game_state) then
+        call_method(local_pawn, "ShowAllSurvivors(Local)", read_property(game_state, "LiveSurvivors_PlayerState"))
+    end
 end
 
 local function apply_player_visual(info, enabled)
@@ -1164,10 +1406,14 @@ local function clear_vision_marks()
             if VISION_FORCED_NAMEPLATES[actor_name] then
                 set_character_nameplate(actor, nil, false)
             end
+            restore_character_visibility(actor)
             cleared = cleared + 1
         end
         VISION_MARKED_ACTORS[actor_name] = nil
         VISION_FORCED_NAMEPLATES[actor_name] = nil
+    end
+    for key, _ in pairs(VISION_VISIBILITY_STATES) do
+        restore_visibility_state_by_key(key)
     end
     set_local_vision_controller_state(false)
     return cleared
@@ -1183,6 +1429,7 @@ local function apply_vision(reason, ar, quiet)
     end
 
     set_local_vision_controller_state(true)
+    apply_builtin_local_vision()
 
     local infos = get_player_infos()
     local applied = 0
@@ -1204,6 +1451,7 @@ local function apply_vision(reason, ar, quiet)
                 if VISION_FORCED_NAMEPLATES[actor_name] then
                     set_character_nameplate(actor, nil, false)
                 end
+                restore_character_visibility(actor)
             end
             VISION_MARKED_ACTORS[actor_name] = nil
             VISION_FORCED_NAMEPLATES[actor_name] = nil
@@ -1373,7 +1621,7 @@ local function help(ar)
     console(ar, "  cham size reset                     把当前本地 Pawn 体型还原为 1.0，并关闭持续体型应用。")
     console(ar, "  cham setrandomplayersize <正数>     随机选择一位其他玩家改体型；排除自己；尽可能请求全房间可见。")
     console(ar, "  cham players                        列出当前可定位到的玩家、阵营、角色 Actor。")
-    console(ar, "  cham vision on/off                  只在本机视角启用或关闭全局玩家身体位置显示。")
+    console(ar, "  cham vision on/off                  只在本机视角启用或关闭全局玩家身体位置显示；默认会尝试显示隐身/隐藏玩家。")
     console(ar, "  cham vision status                  查看全局视觉状态和当前可定位玩家。")
     console(ar, "  cham vision mode glow/name/both     glow=身体发光，name=名字牌，both=两者都开。默认 glow。")
     console(ar, "  cham vision target all/survivor/hunter  选择显示全部、幸存者或猎人。")
@@ -1387,7 +1635,7 @@ local function startup_help()
     console(nil, "常用：cham status | cham apply | cham size 0.05 | cham size debug | cham size reset | cham vision on")
     console(nil, "好友整活：cham setrandomplayersize 0.25 | cham setrandomplayersize 3")
     console(nil, "相机：cham set fov 105 | cham set tps 560 | 移动：cham set speed 1.15 | 绘画：cham paint unlock")
-    console(nil, "全局视觉：cham players | cham vision mode glow | cham vision target all | cham vision off")
+    console(nil, "全局视觉：cham players | cham vision on | cham vision mode glow | cham vision target all | cham vision off")
 end
 
 local function handle_size_command(ar, parameters)
